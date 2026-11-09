@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calculadora de riesgo (demo)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #1b2430; }
+  h1 { font-size: 1.3rem; }
+  fieldset { border: 1px solid #cfd6df; border-radius: 6px; margin-bottom: 1rem; }
+  label { display: block; font-size: .85rem; margin: .3rem 0; }
+  input, select, button { font: inherit; padding: .35rem .5rem; width: 100%; box-sizing: border-box; }
+  button { cursor: pointer; width: auto; }
+  .fila { display: grid; grid-template-columns: 1fr 1fr; gap: .2rem 1rem; }
+  #resultado { padding: 1rem; border-radius: 6px; margin-top: 1rem; display: none; }
+  .aprobado { background: #e6f4ea; } .revision { background: #fff4d6; } .rechazo { background: #fdeaea; }
+  .aviso { font-size: .8rem; color: #5b6675; }
+  #error { color: #a31616; min-height: 1.2rem; }
+</style>
+</head>
+<body>
+<h1>Calculadora de riesgo (demo)</h1>
+<p class="aviso">Datos, reglas y modelo inventados. Sirve para mostrar la arquitectura, no para decidir créditos.</p>
+<div id="error"></div>
+
+<form id="login">
+  <fieldset>
+    <legend>Acceso</legend>
+    <div class="fila">
+      <label>Usuario <input id="usuario" autocomplete="username" required></label>
+      <label>Clave <input id="clave" type="password" autocomplete="current-password" required></label>
+    </div>
+    <button type="submit">Entrar</button>
+  </fieldset>
+</form>
+
+<form id="calculo" hidden>
+  <fieldset>
+    <legend>Captura</legend>
+    <label>Producto
+      <select id="producto"><option value="consumo">consumo</option><option value="microempresa">microempresa</option></select>
+    </label>
+    <label>Cliente de referencia (opcional, autocompleta)
+      <input id="cliente_id" placeholder="CLI-000001">
+    </label>
+    <button type="button" id="buscar">Buscar</button>
+    <div class="fila">
+      <label>Edad <input id="edad" type="number" min="18" max="100" required></label>
+      <label>Ingreso mensual <input id="ingreso_mensual" type="number" min="1" required></label>
+      <label>Antigüedad (meses) <input id="antiguedad_meses" type="number" min="0" required></label>
+      <label>Mora promedio (días) <input id="mora_promedio_dias" type="number" min="0" step="0.1" required></label>
+      <label>Créditos previos <input id="creditos_previos" type="number" min="0" required></label>
+      <label>Deuda mensual <input id="deuda_mensual" type="number" min="0" required></label>
+      <label>Monto solicitado <input id="monto_solicitado" type="number" min="1" required></label>
+      <label>Plazo (meses) <input id="plazo_meses" type="number" min="1" required></label>
+    </div>
+    <button type="submit">Calcular</button>
+  </fieldset>
+</form>
+<div id="resultado"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const CAMPOS = ["edad", "ingreso_mensual", "antiguedad_meses", "mora_promedio_dias",
+                "creditos_previos", "deuda_mensual", "monto_solicitado", "plazo_meses"];
+let token = null;
+
+async function api(ruta, opciones = {}) {
+  const cabeceras = { "Content-Type": "application/json" };
+  if (token) cabeceras.Authorization = "Bearer " + token;
+  const r = await fetch(ruta, { ...opciones, headers: cabeceras });
+  const cuerpo = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(typeof cuerpo.detail === "string" ? cuerpo.detail : "Datos inválidos (" + r.status + ")");
+  return cuerpo;
+}
+const mostrarError = (e) => { $("error").textContent = e ? e.message : ""; };
+
+$("login").addEventListener("submit", async (ev) => {
+  ev.preventDefault(); mostrarError();
+  try {
+    const r = await api("/api/auth/login", { method: "POST", body: JSON.stringify({ usuario: $("usuario").value, clave: $("clave").value }) });
+    token = r.token; $("login").hidden = true; $("calculo").hidden = false;
+  } catch (e) { mostrarError(e); }
+});
+
+$("buscar").addEventListener("click", async () => {
+  mostrarError();
+  try {
+    const c = await api("/api/lookup/cliente/" + encodeURIComponent($("cliente_id").value));
+    CAMPOS.forEach((k) => { if (k in c) $(k).value = c[k]; });
+  } catch (e) { mostrarError(e); }
+});
+
+$("calculo").addEventListener("submit", async (ev) => {
+  ev.preventDefault(); mostrarError();
+  const cuerpo = { cliente_id: $("cliente_id").value || null };
+  CAMPOS.forEach((k) => { cuerpo[k] = Number($(k).value); });
+  try {
+    const r = await api("/api/calcular/" + $("producto").value, { method: "POST", body: JSON.stringify(cuerpo) });
+    const caja = $("resultado");
+    caja.className = r.decision; caja.style.display = "block";
+    caja.textContent = "Decisión: " + r.decision + " · score " + r.score + " · decil " + r.decil +
+      " · monto " + r.monto_aprobado + (r.motivos.length ? " · motivos: " + r.motivos.join(", ") : "") +
+      " · reglas " + r.version_reglas;
+  } catch (e) { mostrarError(e); }
+});
+</script>
+</body>
+</html>

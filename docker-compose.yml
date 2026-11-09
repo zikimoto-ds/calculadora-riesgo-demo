@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: calculadora
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: calculadora
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U calculadora"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    # Sin puertos publicados: solo la API llega a la base.
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://calculadora:${POSTGRES_PASSWORD}@db:5432/calculadora
+      JWT_SECRET: ${JWT_SECRET:?define JWT_SECRET en .env}
+      TOKEN_MINUTOS: ${TOKEN_MINUTOS:-60}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  pg_data:

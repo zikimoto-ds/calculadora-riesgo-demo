@@ -1,0 +1,97 @@
+from app import calculadora
+
+from .conftest import CLAVE_ANA, CLAVE_SUP, SOLICITUD_OK, encabezados
+
+
+def _caso_en_revision() -> dict:
+    """Busca una solicitud que caiga en la zona de revisión con las reglas actuales."""
+    for ingreso in range(8000, 40001, 4000):
+        for mora in (0, 6, 12, 18, 24):
+            for ratio in (0.05, 0.15, 0.25, 0.35, 0.45):
+                for previos in (0, 2, 4):
+                    caso = {
+                        **SOLICITUD_OK,
+                        "ingreso_mensual": ingreso,
+                        "mora_promedio_dias": mora,
+                        "deuda_mensual": round(ingreso * ratio),
+                        "creditos_previos": previos,
+                        "antiguedad_meses": 24,
+                        "monto_solicitado": 10000,
+                    }
+                    if calculadora.calcular("consumo", caso)["decision"] == "revision":
+                        return caso
+    raise AssertionError("No se encontró un caso de revisión: ajustar los cortes de config/reglas.json")
+
+
+def test_health(cliente):
+    assert cliente.get("/health").json() == {"estado": "ok"}
+
+
+def test_login_correcto_e_incorrecto(cliente):
+    assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": "mala"}).status_code == 401
+    assert cliente.post("/api/auth/login", json={"usuario": "nadie", "clave": "x"}).status_code == 401
+    r = cliente.post("/api/auth/login", json={"usuario": "ana", "clave": CLAVE_ANA})
+    assert r.status_code == 200 and r.json()["rol"] == "analista"
+
+
+def test_bloqueo_tras_intentos_fallidos(cliente):
+    for _ in range(5):
+        cliente.post("/api/auth/login", json={"usuario": "ana", "clave": "mala"})
+    r = cliente.post("/api/auth/login", json={"usuario": "ana", "clave": CLAVE_ANA})
+    assert r.status_code == 401
+
+
+def test_rutas_protegidas_sin_token(cliente):
+    assert cliente.get("/api/auth/me").status_code == 401
+    assert cliente.post("/api/calcular/consumo", json=SOLICITUD_OK).status_code == 401
+    assert cliente.get("/api/auth/me", headers={"Authorization": "Bearer basura"}).status_code == 401
+
+
+def test_calcular_guarda_en_bitacora_y_aparece_en_dashboard(cliente):
+    h = encabezados(cliente, "ana", CLAVE_ANA)
+    r = cliente.post("/api/calcular/consumo", json=SOLICITUD_OK, headers=h)
+    assert r.status_code == 200 and r.json()["decision"] == "aprobado"
+    resumen = cliente.get("/api/dashboard/resumen", headers=h).json()
+    assert resumen["total"] == 1
+    assert resumen["por_producto"]["consumo"]["decisiones"]["aprobado"]["n"] == 1
+
+
+def test_validacion_de_entrada(cliente):
+    h = encabezados(cliente, "ana", CLAVE_ANA)
+    assert cliente.post("/api/calcular/consumo", json={**SOLICITUD_OK, "edad": 12}, headers=h).status_code == 422
+    assert cliente.post("/api/calcular/consumo", json={**SOLICITUD_OK, "ingreso_mensual": 0}, headers=h).status_code == 422
+    assert cliente.post("/api/calcular/inexistente", json=SOLICITUD_OK, headers=h).status_code == 404
+
+
+def test_lookup_cliente(cliente):
+    h = encabezados(cliente, "ana", CLAVE_ANA)
+    assert cliente.get("/api/lookup/cliente/CLI-000001", headers=h).json()["ingreso_mensual"] == 18000
+    assert cliente.get("/api/lookup/cliente/NO-EXISTE", headers=h).status_code == 404
+
+
+def test_flujo_de_revision_manual(cliente):
+    ana = encabezados(cliente, "ana", CLAVE_ANA)
+    sup = encabezados(cliente, "sup", CLAVE_SUP)
+    r = cliente.post("/api/calcular/consumo", json=_caso_en_revision(), headers=ana)
+    assert r.json()["decision"] == "revision"
+
+    pendientes = cliente.get("/api/revisiones", headers=ana).json()
+    assert len(pendientes) == 1
+    rid = pendientes[0]["id"]
+
+    assert cliente.post(f"/api/revisiones/{rid}/resolver", json={"decision": "aprobada"}, headers=ana).status_code == 403
+    ok = cliente.post(f"/api/revisiones/{rid}/resolver", json={"decision": "aprobada", "comentario": "ok"}, headers=sup)
+    assert ok.status_code == 200 and ok.json()["estado"] == "aprobada"
+    assert cliente.post(f"/api/revisiones/{rid}/resolver", json={"decision": "rechazada"}, headers=sup).status_code == 409
+    assert cliente.get("/api/revisiones", headers=ana).json() == []
+
+
+def test_crear_usuario_solo_supervisor_y_clave_larga(cliente):
+    ana = encabezados(cliente, "ana", CLAVE_ANA)
+    sup = encabezados(cliente, "sup", CLAVE_SUP)
+    nuevo = {"usuario": "luis", "clave": "una-clave-bien-larga-1", "rol": "analista"}
+    assert cliente.post("/api/usuarios", json=nuevo, headers=ana).status_code == 403
+    assert cliente.post("/api/usuarios", json={**nuevo, "clave": "corta"}, headers=sup).status_code == 422
+    assert cliente.post("/api/usuarios", json=nuevo, headers=sup).status_code == 201
+    assert cliente.post("/api/usuarios", json=nuevo, headers=sup).status_code == 409
+    assert encabezados(cliente, "luis", "una-clave-bien-larga-1")
