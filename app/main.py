@@ -9,13 +9,14 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-from sqlalchemy import func, select, text
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import calculadora, config, modelo, seguridad
 from .db import Base, get_db, motor
-from .models import Auditoria, CalculoLog, RefCliente, Revision, Usuario, ahora
+from .models import Auditoria, CalculoLog, RefCliente, Revision, Usuario, ahora, utc
 
 RAIZ = Path(__file__).resolve().parent.parent
 _HASH_FALSO = seguridad.hashear_clave("no-es-una-clave-real")  # iguala el tiempo de respuesta ante usuarios inexistentes
@@ -28,35 +29,46 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Calculadora de riesgo (demo)", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Calculadora de riesgo (demo)", version="0.2.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=RAIZ / "static"), name="static")
 bearer = HTTPBearer(auto_error=False)
 
 
 # ---------- esquemas ----------
-class Credenciales(BaseModel):
+class EsquemaBase(BaseModel):
+    """Rechaza NUL en cualquier campo de texto: PostgreSQL no lo admite y acabaría en un 500."""
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _sin_nul(cls, v):
+        if isinstance(v, str) and "\x00" in v:
+            raise ValueError("carácter NUL no permitido")
+        return v
+
+
+class Credenciales(EsquemaBase):
     usuario: str = Field(min_length=1, max_length=50)
     clave: str = Field(min_length=1, max_length=200)
 
 
-class Solicitud(BaseModel):
+class Solicitud(EsquemaBase):
     cliente_id: str | None = Field(default=None, max_length=20)
     edad: int = Field(ge=18, le=100)
-    ingreso_mensual: float = Field(gt=0, le=10_000_000)
+    ingreso_mensual: float = Field(ge=1, le=10_000_000)  # mínimo 1: evita ratios infinitos con ingresos ínfimos
     antiguedad_meses: int = Field(ge=0, le=720)
     mora_promedio_dias: float = Field(ge=0, le=365)
     creditos_previos: int = Field(ge=0, le=100)
     deuda_mensual: float = Field(ge=0, le=10_000_000)
-    monto_solicitado: float = Field(gt=0, le=10_000_000)
+    monto_solicitado: float = Field(ge=1, le=10_000_000)
     plazo_meses: int = Field(ge=1, le=120)
 
 
-class ResolverRevision(BaseModel):
+class ResolverRevision(EsquemaBase):
     decision: Literal["aprobada", "rechazada"]
     comentario: str | None = Field(default=None, max_length=500)
 
 
-class NuevoUsuario(BaseModel):
+class NuevoUsuario(EsquemaBase):
     usuario: str = Field(min_length=3, max_length=50, pattern=r"^[a-z0-9._-]+$")
     clave: str = Field(min_length=12, max_length=200)
     rol: Literal["analista", "supervisor"] = "analista"
@@ -66,6 +78,10 @@ class NuevoUsuario(BaseModel):
 def _auditar(db: Session, usuario: str | None, accion: str, detalle: str = "") -> None:
     db.add(Auditoria(usuario=usuario, accion=accion, detalle=detalle[:300]))
     db.commit()
+
+
+def _bloqueado(usuario: Usuario) -> bool:
+    return usuario.bloqueado_hasta is not None and ahora() < utc(usuario.bloqueado_hasta)
 
 
 def usuario_actual(
@@ -78,7 +94,7 @@ def usuario_actual(
     except jwt.PyJWTError:
         raise HTTPException(401, "Token inválido o vencido")
     usuario = db.scalar(select(Usuario).where(Usuario.usuario == datos["sub"]))
-    if usuario is None or not usuario.activo:
+    if usuario is None or not usuario.activo or _bloqueado(usuario):
         raise HTTPException(401, "Usuario inactivo")
     return usuario
 
@@ -108,16 +124,30 @@ def inicio():
 @app.post("/api/auth/login")
 def login(c: Credenciales, db: Session = Depends(get_db)):
     usuario = db.scalar(select(Usuario).where(Usuario.usuario == c.usuario))
-    bloqueado = usuario is not None and usuario.intentos_fallidos >= config.MAX_INTENTOS
-    if usuario is None or not usuario.activo or bloqueado:
+    if usuario is None or not usuario.activo or _bloqueado(usuario):
         seguridad.verificar_clave(c.clave, _HASH_FALSO)
         _auditar(db, c.usuario, "login_rechazado", "inexistente, inactivo o bloqueado")
         raise HTTPException(401, "Credenciales inválidas")
     if not seguridad.verificar_clave(c.clave, usuario.clave_hash):
-        usuario.intentos_fallidos += 1
-        _auditar(db, usuario.usuario, "login_fallido", f"intento {usuario.intentos_fallidos}")
+        # Incremento atómico en la base: con peticiones concurrentes un += en memoria pierde intentos.
+        intentos = db.execute(
+            update(Usuario)
+            .where(Usuario.id == usuario.id)
+            .values(intentos_fallidos=Usuario.intentos_fallidos + 1)
+            .returning(Usuario.intentos_fallidos)
+        ).scalar_one()
+        detalle = f"intento {intentos}"
+        if intentos >= config.MAX_INTENTOS:
+            db.execute(
+                update(Usuario)
+                .where(Usuario.id == usuario.id)
+                .values(bloqueado_hasta=ahora() + timedelta(minutes=config.BLOQUEO_MINUTOS), intentos_fallidos=0)
+            )
+            detalle += f"; cuenta bloqueada {config.BLOQUEO_MINUTOS} min"
+        _auditar(db, usuario.usuario, "login_fallido", detalle)
         raise HTTPException(401, "Credenciales inválidas")
     usuario.intentos_fallidos = 0
+    usuario.bloqueado_hasta = None
     _auditar(db, usuario.usuario, "login_ok")
     return {"token": seguridad.crear_token(usuario.usuario, usuario.rol), "rol": usuario.rol}
 
@@ -128,10 +158,11 @@ def yo(usuario: Usuario = Depends(usuario_actual)):
 
 
 @app.get("/api/lookup/cliente/{cliente_id}")
-def lookup_cliente(cliente_id: str, _: Usuario = Depends(usuario_actual), db: Session = Depends(get_db)):
+def lookup_cliente(cliente_id: str, usuario: Usuario = Depends(usuario_actual), db: Session = Depends(get_db)):
     c = db.get(RefCliente, cliente_id)
     if c is None:
         raise HTTPException(404, "Cliente no encontrado")
+    _auditar(db, usuario.usuario, "lookup_cliente", cliente_id)  # la bitácora registra quién consultó a quién
     campos = ("edad", "ingreso_mensual", "antiguedad_meses", "mora_promedio_dias", "creditos_previos", "deuda_mensual")
     return {"cliente_id": c.cliente_id, **{k: getattr(c, k) for k in campos}}
 
@@ -188,12 +219,15 @@ def listar_revisiones(
             "id": r.id,
             "calculo_id": c.id,
             "producto": c.producto,
+            "capturado_por": c.usuario,
+            "cliente_id": c.cliente_id,
+            "entrada": c.entrada,  # el supervisor resuelve viendo los datos del caso, no solo el score
             "score": c.score,
             "decil": c.decil,
             "monto_sugerido": c.monto_aprobado,
             "motivos": c.motivos,
             "estado": r.estado,
-            "creado": r.creado,
+            "creado": utc(r.creado),
         }
         for r, c in filas
     ]
@@ -209,15 +243,26 @@ def resolver_revision(
     r = db.get(Revision, revision_id)
     if r is None:
         raise HTTPException(404, "Revisión no encontrada")
-    if r.estado != "pendiente":
+    calculo = db.get(CalculoLog, r.calculo_id)
+    if calculo is not None and calculo.usuario == supervisor.usuario:
+        raise HTTPException(403, "No puedes resolver una revisión de un cálculo capturado por ti")
+    # UPDATE condicional: si dos supervisores resuelven a la vez, solo uno modifica la fila.
+    resueltas = db.execute(
+        update(Revision)
+        .where(Revision.id == revision_id, Revision.estado == "pendiente")
+        .values(
+            estado=cuerpo.decision,
+            comentario=cuerpo.comentario,
+            resuelto_por=supervisor.usuario,
+            resuelto_en=ahora(),
+        )
+    ).rowcount
+    if resueltas != 1:
+        db.rollback()
         raise HTTPException(409, "La revisión ya fue resuelta")
-    r.estado = cuerpo.decision
-    r.comentario = cuerpo.comentario
-    r.resuelto_por = supervisor.usuario
-    r.resuelto_en = ahora()
     db.add(Auditoria(usuario=supervisor.usuario, accion="resolver_revision", detalle=f"{revision_id}: {cuerpo.decision}"))
     db.commit()
-    return {"id": r.id, "estado": r.estado}
+    return {"id": revision_id, "estado": cuerpo.decision}
 
 
 @app.get("/api/dashboard/resumen")
@@ -237,6 +282,11 @@ def resumen(
         select(dia, func.count()).where(CalculoLog.creado >= desde).group_by(dia).order_by(dia)
     ).all()
     pendientes = db.scalar(select(func.count()).select_from(Revision).where(Revision.estado == "pendiente"))
+    resueltas = dict(
+        db.execute(
+            select(Revision.estado, func.count()).where(Revision.estado != "pendiente").group_by(Revision.estado)
+        ).all()
+    )
 
     productos: dict = {}
     for producto, decision, n, score_prom in por_decision:
@@ -249,6 +299,10 @@ def resumen(
         "por_producto": productos,
         "por_dia": [{"dia": str(d), "calculos": n} for d, n in por_dia],
         "revisiones_pendientes": pendientes,
+        "revisiones_resueltas": {
+            "aprobada": resueltas.get("aprobada", 0),
+            "rechazada": resueltas.get("rechazada", 0),
+        },
     }
 
 
@@ -260,5 +314,9 @@ def crear_usuario(
         raise HTTPException(409, "El usuario ya existe")
     db.add(Usuario(usuario=nuevo.usuario, clave_hash=seguridad.hashear_clave(nuevo.clave), rol=nuevo.rol))
     db.add(Auditoria(usuario=supervisor.usuario, accion="crear_usuario", detalle=f"{nuevo.usuario} ({nuevo.rol})"))
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:  # dos peticiones simultáneas con el mismo nombre: la segunda choca con el índice único
+        db.rollback()
+        raise HTTPException(409, "El usuario ya existe")
     return {"usuario": nuevo.usuario, "rol": nuevo.rol}

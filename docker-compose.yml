@@ -18,14 +18,18 @@ services:
   api:
     build: .
     environment:
-      DATABASE_URL: postgresql+psycopg://calculadora:${POSTGRES_PASSWORD}@db:5432/calculadora
+      # Piezas sueltas (no una URL): una contraseña con '@' o '/' no rompe la conexión.
+      DB_HOST: db
+      DB_USER: calculadora
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
+      DB_NAME: calculadora
       JWT_SECRET: ${JWT_SECRET:?define JWT_SECRET en .env}
       TOKEN_MINUTOS: ${TOKEN_MINUTOS:-60}
     depends_on:
       db:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"  # solo loopback: la demo habla HTTP sin TLS
     restart: unless-stopped
 
 volumes:

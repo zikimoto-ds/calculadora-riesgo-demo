@@ -1,4 +1,8 @@
-"""Decisión: reglas duras primero, después modelo y cortes. Los umbrales viven en config/reglas.json."""
+"""Decisión: reglas duras primero, después modelo y cortes.
+
+Los umbrales viven en config/reglas.json y se cargan una vez por proceso:
+cambiar el archivo exige reiniciar la API (la versión aplicada queda en cada cálculo).
+"""
 import json
 from functools import lru_cache
 from pathlib import Path

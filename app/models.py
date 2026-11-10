@@ -11,6 +11,13 @@ def ahora() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def utc(dt: datetime | None) -> datetime | None:
+    """Añade la zona UTC a fechas naive: SQLite guarda y devuelve sin zona; PostgreSQL con ella."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 class Usuario(Base):
     __tablename__ = "usuarios"
 
@@ -20,6 +27,7 @@ class Usuario(Base):
     rol: Mapped[str] = mapped_column(String(20), default="analista")  # analista | supervisor
     activo: Mapped[bool] = mapped_column(Boolean, default=True)
     intentos_fallidos: Mapped[int] = mapped_column(Integer, default=0)
+    bloqueado_hasta: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     creado: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)
 
 
@@ -61,7 +69,7 @@ class Revision(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     calculo_id: Mapped[int] = mapped_column(ForeignKey("calculo_log.id"), index=True)
-    estado: Mapped[str] = mapped_column(String(20), default="pendiente")  # pendiente | aprobada | rechazada
+    estado: Mapped[str] = mapped_column(String(20), default="pendiente", index=True)  # pendiente | aprobada | rechazada
     comentario: Mapped[str | None] = mapped_column(String(500), nullable=True)
     resuelto_por: Mapped[str | None] = mapped_column(String(50), nullable=True)
     creado: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)

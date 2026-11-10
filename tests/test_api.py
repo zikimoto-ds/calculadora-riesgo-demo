@@ -86,6 +86,33 @@ def test_flujo_de_revision_manual(cliente):
     assert cliente.get("/api/revisiones", headers=ana).json() == []
 
 
+def test_rechaza_nul_e_ingresos_degenerados(cliente):
+    h = encabezados(cliente, "ana", CLAVE_ANA)
+    assert cliente.post("/api/auth/login", json={"usuario": "a\u0000b", "clave": "x"}).status_code == 422
+    assert cliente.post("/api/calcular/consumo", json={**SOLICITUD_OK, "ingreso_mensual": 1e-320}, headers=h).status_code == 422
+    rev = {"decision": "aprobada", "comentario": "con\u0000nul"}
+    assert cliente.post("/api/revisiones/1/resolver", json=rev, headers=encabezados(cliente, "sup", CLAVE_SUP)).status_code == 422
+
+
+def test_supervisor_no_resuelve_su_propio_calculo(cliente):
+    sup = encabezados(cliente, "sup", CLAVE_SUP)
+    r = cliente.post("/api/calcular/consumo", json=_caso_en_revision(), headers=sup)
+    assert r.json()["decision"] == "revision"
+    rid = cliente.get("/api/revisiones", headers=sup).json()[0]["id"]
+    assert cliente.post(f"/api/revisiones/{rid}/resolver", json={"decision": "aprobada"}, headers=sup).status_code == 403
+
+
+def test_token_sin_claims_obligatorios_es_rechazado(cliente):
+    import os
+
+    import jwt as pyjwt
+
+    sin_exp = pyjwt.encode({"sub": "ana"}, os.environ["JWT_SECRET"], algorithm="HS256")
+    sin_sub = pyjwt.encode({"rol": "supervisor"}, os.environ["JWT_SECRET"], algorithm="HS256")
+    for t in (sin_exp, sin_sub):
+        assert cliente.get("/api/auth/me", headers={"Authorization": "Bearer " + t}).status_code == 401
+
+
 def test_crear_usuario_solo_supervisor_y_clave_larga(cliente):
     ana = encabezados(cliente, "ana", CLAVE_ANA)
     sup = encabezados(cliente, "sup", CLAVE_SUP)

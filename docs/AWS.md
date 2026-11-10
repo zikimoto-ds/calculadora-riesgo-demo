@@ -46,7 +46,7 @@ El job del reporte usa la misma imagen que la API y, como ella, lee sus secretos
 | ECS Fargate | Corre la misma imagen que en local, 2 tareas en 2 zonas | Sin servidores que parchear; escala por CPU |
 | RDS PostgreSQL | `usuarios`, `calculo_log`, `revision_manual`, `auditoria`, `ref_cliente` | Multi-AZ, backups automáticos, cifrado con KMS; subredes sin ruta a internet |
 | Secrets Manager | `JWT_SECRET` y credenciales de la base | Se inyectan como variables de entorno de la tarea; no hay secretos en la imagen ni en el repo |
-| EventBridge Scheduler + ECS | Ejecuta `python -m scripts.reporte_diario --s3-bucket …` cada mañana | Sustituye el armado manual del reporte; el resultado llega a S3 antes de que empiece la operación |
+| EventBridge Scheduler + ECS | Ejecuta `python -m scripts.reporte_diario --tz America/Mexico_City --s3-bucket …` cada mañana | Sustituye el armado manual del reporte; el corte del día usa la zona de la operación y el resultado llega a S3 antes de que empiece |
 | S3 + SNS/SES | Guarda el Excel y avisa por correo | Versionado y cifrado; el enlace se comparte con URL prefirmada |
 | CloudWatch | Logs, métricas y alarmas | Alarmas sugeridas: 5xx del ALB, CPU de las tareas, almacenamiento libre de RDS, fallo de la tarea programada |
 | GitHub Actions + ECR | Compila, prueba y publica la imagen | OIDC con rol de AWS: no se guardan llaves de acceso en GitHub |

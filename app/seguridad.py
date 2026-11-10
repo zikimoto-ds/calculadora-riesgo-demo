@@ -31,8 +31,10 @@ def verificar_clave(clave: str, almacenado: str) -> bool:
 
 def crear_token(usuario: str, rol: str) -> str:
     vence = datetime.now(timezone.utc) + timedelta(minutes=config.TOKEN_MINUTOS)
-    return jwt.encode({"sub": usuario, "rol": rol, "exp": vence}, config.JWT_SECRET, algorithm="HS256")
+    return jwt.encode({"sub": usuario, "rol": rol, "exp": vence}, config.jwt_secret(), algorithm="HS256")
 
 
 def leer_token(token: str) -> dict:
-    return jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
+    # `require` obliga a que el token traiga sujeto y caducidad; un token firmado
+    # sin `exp` sería eterno y uno sin `sub` rompería la búsqueda del usuario.
+    return jwt.decode(token, config.jwt_secret(), algorithms=["HS256"], options={"require": ["sub", "exp"]})
