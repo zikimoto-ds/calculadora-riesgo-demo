@@ -28,6 +28,7 @@ class Usuario(Base):
     activo: Mapped[bool] = mapped_column(Boolean, default=True)
     intentos_fallidos: Mapped[int] = mapped_column(Integer, default=0)
     bloqueado_hasta: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    version_token: Mapped[int] = mapped_column(Integer, default=0)  # sube al cambiar la clave o (des)activar: revoca tokens previos
     creado: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)
 
 

@@ -33,7 +33,30 @@ def usuario_actual(
     usuario = db.scalar(select(Usuario).where(Usuario.usuario == datos["sub"]))
     if usuario is None or not usuario.activo or _bloqueado(usuario):
         raise HTTPException(401, "Usuario inactivo")
+    if datos["ver"] != usuario.version_token:  # emitido antes de un cambio de clave o de una (des)activación
+        raise HTTPException(401, "Token inválido o vencido")
     return usuario
+
+
+def registrar_intento_fallido(db: Session, usuario: Usuario) -> int | None:
+    """Suma un intento fallido (mismo contador que el login) y bloquea la cuenta al llegar al límite.
+
+    Devuelve el número de intento, o None si la cuenta ya estaba bloqueada.
+    """
+    intentos = db.execute(
+        update(Usuario)
+        .where(Usuario.id == usuario.id, or_(Usuario.bloqueado_hasta.is_(None), Usuario.bloqueado_hasta < ahora()))
+        .values(intentos_fallidos=Usuario.intentos_fallidos + 1)
+        .returning(Usuario.intentos_fallidos)
+        .execution_options(synchronize_session=False)
+    ).scalar_one_or_none()
+    if intentos is not None and intentos >= config.MAX_INTENTOS:
+        db.execute(
+            update(Usuario)
+            .where(Usuario.id == usuario.id)
+            .values(bloqueado_hasta=ahora() + timedelta(minutes=config.BLOQUEO_MINUTOS), intentos_fallidos=0)
+        )
+    return intentos
 
 
 def solo_supervisor(usuario: Usuario = Depends(usuario_actual)) -> Usuario:
@@ -91,7 +114,7 @@ def login(c: Credenciales, db: Session = Depends(get_db)):
         auditar(db, usuario.usuario, "login_rechazado", "cuenta bloqueada")
         raise HTTPException(401, "Credenciales inválidas")
     auditar(db, usuario.usuario, "login_ok")
-    return {"token": seguridad.crear_token(usuario.usuario, usuario.rol), "rol": usuario.rol}
+    return {"token": seguridad.crear_token(usuario.usuario, usuario.rol, usuario.version_token), "rol": usuario.rol}
 
 
 @router.get("/me")

@@ -29,12 +29,14 @@ def verificar_clave(clave: str, almacenado: str) -> bool:
     return hmac.compare_digest(h, esperado)
 
 
-def crear_token(usuario: str, rol: str) -> str:
+def crear_token(usuario: str, rol: str, version: int) -> str:
+    """`ver` es la versión de token del usuario: cambiar la clave o desactivar la
+    cuenta la incrementa, con lo que los tokens emitidos antes dejan de valer."""
     vence = datetime.now(timezone.utc) + timedelta(minutes=config.TOKEN_MINUTOS)
-    return jwt.encode({"sub": usuario, "rol": rol, "exp": vence}, config.jwt_secret(), algorithm="HS256")
+    return jwt.encode({"sub": usuario, "rol": rol, "ver": version, "exp": vence}, config.jwt_secret(), algorithm="HS256")
 
 
 def leer_token(token: str) -> dict:
-    # `require` obliga a que el token traiga sujeto y caducidad; un token firmado
-    # sin `exp` sería eterno y uno sin `sub` rompería la búsqueda del usuario.
-    return jwt.decode(token, config.jwt_secret(), algorithms=["HS256"], options={"require": ["sub", "exp"]})
+    # `require` obliga a que el token traiga sujeto, versión y caducidad; un token
+    # firmado sin `exp` sería eterno y uno sin `sub` rompería la búsqueda del usuario.
+    return jwt.decode(token, config.jwt_secret(), algorithms=["HS256"], options={"require": ["sub", "exp", "ver"]})

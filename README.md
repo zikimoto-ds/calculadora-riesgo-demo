@@ -66,8 +66,8 @@ Reporte diario: `python -m scripts.reporte_diario --fecha 2026-01-15 --tz Americ
 | `GET /api/dashboard/resumen` | autenticado | Conteos por producto, decisión y día, estado de las revisiones y métricas de los modelos |
 | `POST /api/usuarios` | supervisor | Crea un usuario (clave de al menos 12 caracteres) |
 | `GET /api/usuarios` | supervisor | Listado para administración (sin hashes) |
-| `PATCH /api/usuarios/{usuario}/activo` | supervisor | Activa o desactiva una cuenta (nunca la propia); desactivar invalida los tokens vigentes |
-| `POST /api/usuarios/me/clave` | autenticado | Cambia la clave propia verificando la actual |
+| `PATCH /api/usuarios/{usuario}/activo` | supervisor | Activa o desactiva una cuenta (nunca la propia); ambas acciones invalidan los tokens emitidos antes |
+| `POST /api/usuarios/me/clave` | autenticado | Cambia la clave propia verificando la actual; devuelve un token nuevo y revoca los anteriores. Los intentos fallidos cuentan para el bloqueo |
 
 ## Decisiones de diseño
 
@@ -85,7 +85,7 @@ Reporte diario: `python -m scripts.reporte_diario --fecha 2026-01-15 --tz Americ
 - El proveedor externo de score es una simulación determinista; en producción sería una llamada HTTPS con timeout corto, reintentos y bitácora de consumo.
 - Las tablas se crean con `create_all`; en producción corresponde usar migraciones (Alembic).
 - La interfaz es mínima y no hay limitación de tasa dentro de la app (se propone en el WAF, ver `docs/AWS.md`); cada intento de login anónimo cuesta un scrypt y una fila de auditoría.
-- No hay revocación de sesiones: un token emitido sigue siendo válido hasta su vencimiento aunque la cuenta cambie de clave después. Como compensación parcial, una cuenta bloqueada tampoco puede usar sus tokens vigentes; el intercambio es deliberado (contener una cuenta posiblemente comprometida pesa más que la disponibilidad) y permite que cualquiera que conozca un usuario lo deje fuera 15 minutos con intentos fallidos. En producción, el límite de tasa por IP del WAF frena eso antes de llegar a la app.
+- La revocación de sesiones es por versión de token (claim `ver`): cambiar la clave o desactivar/reactivar una cuenta invalida todos los tokens emitidos antes, pero no hay revocación individual de un token concreto. Una cuenta bloqueada tampoco puede usar sus tokens vigentes; el intercambio es deliberado (contener una cuenta posiblemente comprometida pesa más que la disponibilidad) y permite que cualquiera que conozca un usuario lo deje fuera 15 minutos con intentos fallidos. En producción, el límite de tasa por IP del WAF frena eso antes de llegar a la app.
 - `config/reglas.json` se carga una vez por proceso; aplicar cambios requiere reiniciar la API (cada cálculo guarda la versión que lo decidió).
 - Las pruebas automáticas corren sobre SQLite; la ruta con PostgreSQL y `docker compose` no está cubierta por CI.
 

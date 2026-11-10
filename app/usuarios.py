@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import seguridad
-from .autenticacion import _bloqueado, solo_supervisor, usuario_actual
+from .autenticacion import _bloqueado, registrar_intento_fallido, solo_supervisor, usuario_actual
 from .db import get_db
 from .esquemas import ActivarUsuario, CambioClave, NuevoUsuario
 from .models import Auditoria, Usuario, auditar, utc
@@ -52,13 +52,14 @@ def activar_desactivar(
     supervisor: Usuario = Depends(solo_supervisor),
     db: Session = Depends(get_db),
 ):
-    """Desactivar también invalida los tokens vigentes del usuario (usuario_actual exige activo)."""
+    """Desactivar o reactivar sube la versión de token: los tokens emitidos antes quedan inválidos."""
     if nombre == supervisor.usuario:
         raise HTTPException(403, "No puedes desactivar tu propia cuenta")
     u = db.scalar(select(Usuario).where(Usuario.usuario == nombre))
     if u is None:
         raise HTTPException(404, "Usuario no encontrado")
     u.activo = cuerpo.activo
+    u.version_token += 1
     auditar(db, supervisor.usuario, "activar_usuario" if cuerpo.activo else "desactivar_usuario", nombre)
     return {"usuario": u.usuario, "activo": u.activo}
 
@@ -68,8 +69,16 @@ def cambiar_mi_clave(
     cuerpo: CambioClave, usuario: Usuario = Depends(usuario_actual), db: Session = Depends(get_db)
 ):
     if not seguridad.verificar_clave(cuerpo.clave_actual, usuario.clave_hash):
+        # Mismo contador que el login: un token robado no da intentos ilimitados contra la clave actual.
+        registrar_intento_fallido(db, usuario)
         auditar(db, usuario.usuario, "cambio_clave_rechazado", "clave actual incorrecta")
         raise HTTPException(403, "La clave actual no coincide")
     usuario.clave_hash = seguridad.hashear_clave(cuerpo.clave_nueva)
+    usuario.version_token += 1  # revoca los tokens emitidos con la clave anterior
+    usuario.intentos_fallidos = 0
     auditar(db, usuario.usuario, "cambio_clave")
-    return {"usuario": usuario.usuario, "detalle": "clave actualizada"}
+    return {
+        "usuario": usuario.usuario,
+        "detalle": "clave actualizada",
+        "token": seguridad.crear_token(usuario.usuario, usuario.rol, usuario.version_token),
+    }

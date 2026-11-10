@@ -145,6 +145,7 @@ def test_modulo_usuarios_listado_y_activacion(cliente):
     assert cliente.get("/api/auth/me", headers=ana).status_code == 401  # el token vigente muere al desactivar
     assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": CLAVE_ANA}).status_code == 401
     assert cliente.patch("/api/usuarios/ana/activo", json={"activo": True}, headers=sup).status_code == 200
+    assert cliente.get("/api/auth/me", headers=ana).status_code == 401  # reactivar no revive los tokens viejos
     assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": CLAVE_ANA}).status_code == 200
 
 
@@ -155,9 +156,22 @@ def test_cambio_de_clave_propia(cliente):
     assert cliente.post("/api/usuarios/me/clave", json=mal, headers=ana).status_code == 403
     assert cliente.post("/api/usuarios/me/clave", json={"clave_actual": CLAVE_ANA, "clave_nueva": "corta"}, headers=ana).status_code == 422
     ok = {"clave_actual": CLAVE_ANA, "clave_nueva": nueva}
-    assert cliente.post("/api/usuarios/me/clave", json=ok, headers=ana).status_code == 200
+    r = cliente.post("/api/usuarios/me/clave", json=ok, headers=ana)
+    assert r.status_code == 200
+    assert cliente.get("/api/auth/me", headers=ana).status_code == 401  # el token emitido con la clave anterior muere
+    assert cliente.get("/api/auth/me", headers={"Authorization": "Bearer " + r.json()["token"]}).status_code == 200
     assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": CLAVE_ANA}).status_code == 401
     assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": nueva}).status_code == 200
+
+
+def test_fuerza_bruta_en_cambio_de_clave_bloquea_la_cuenta(cliente):
+    ana = encabezados(cliente, "ana", CLAVE_ANA)
+    mal = {"clave_actual": "equivocada", "clave_nueva": "una-clave-nueva-larga-1"}
+    for _ in range(5):
+        assert cliente.post("/api/usuarios/me/clave", json=mal, headers=ana).status_code == 403
+    # Cuenta bloqueada: ni el token vigente ni la clave correcta entran mientras dura el bloqueo.
+    assert cliente.get("/api/auth/me", headers=ana).status_code == 401
+    assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": CLAVE_ANA}).status_code == 401
 
 
 def test_crear_usuario_solo_supervisor_y_clave_larga(cliente):
