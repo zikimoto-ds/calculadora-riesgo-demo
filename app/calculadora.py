@@ -1,13 +1,20 @@
-"""Decisión: reglas duras primero, después modelo y cortes.
+"""Decisión: reglas duras primero, después el ensamble de modelos y el score externo.
 
 Los umbrales viven en config/reglas.json y se cargan una vez por proceso:
 cambiar el archivo exige reiniciar la API (la versión aplicada queda en cada cálculo).
+
+Orden de evaluación:
+1. Reglas duras (edad, mora, endeudamiento, política de monto y plazo) → rechazo.
+2. Score del ensamble (regresión logística + XGBoost) contra los cortes del producto.
+3. Decil del proveedor externo: si no responde, el caso va a revisión manual en vez
+   de decidirse sin el dato; si viene bajo, también va a revisión.
+4. Oferta final: el monto se ajusta por un factor según el decil interno.
 """
 import json
 from functools import lru_cache
 from pathlib import Path
 
-from . import modelo
+from . import modelo, score_externo
 
 RUTA_REGLAS = Path(__file__).resolve().parent.parent / "config" / "reglas.json"
 
@@ -41,7 +48,7 @@ def calcular(producto: str, d: dict) -> dict:
     if d["plazo_meses"] > cfg["plazo_max_meses"]:
         motivos.append("PLAZO_FUERA_DE_POLITICA")
 
-    score, decil = modelo.predecir(
+    m = modelo.predecir(
         {
             "edad": d["edad"],
             "ingreso_mensual": d["ingreso_mensual"],
@@ -51,11 +58,18 @@ def calcular(producto: str, d: dict) -> dict:
             "deuda_ingreso": deuda_ingreso,
         }
     )
+    score, decil = m["score"], m["decil"]
+    externo = score_externo.consultar(d)
+    decil_externo = externo["decil"] if externo else None
 
     if motivos:
         decision = "rechazo"
     elif score < cfg["cortes"]["rechazo_bajo"]:
         decision, motivos = "rechazo", ["SCORE_BAJO"]
+    elif externo is None:
+        decision, motivos = "revision", ["SIN_SCORE_EXTERNO"]
+    elif decil_externo <= cfg["externo"]["decil_revision"]:
+        decision, motivos = "revision", ["SCORE_EXTERNO_EN_ZONA_BAJA"]
     elif score < cfg["cortes"]["revision_bajo"]:
         decision, motivos = "revision", ["SCORE_EN_ZONA_DE_REVISION"]
     else:
@@ -64,12 +78,15 @@ def calcular(producto: str, d: dict) -> dict:
     monto = 0.0
     if decision != "rechazo":
         tope = d["ingreso_mensual"] * cfg["multiplo_ingreso_max"]
-        monto = round(min(d["monto_solicitado"], tope, cfg["monto_max"]), 2)
+        factor = cfg["factor_oferta_decil"][decil - 1]
+        monto = round(min(d["monto_solicitado"], tope * factor, cfg["monto_max"]), 2)
 
     return {
         "decision": decision,
         "score": round(score, 4),
         "decil": decil,
+        "decil_externo": decil_externo,
+        "modelos": m["modelos"],
         "motivos": motivos,
         "monto_aprobado": monto,
         "deuda_ingreso": round(deuda_ingreso, 3),

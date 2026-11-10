@@ -74,6 +74,8 @@ def main() -> None:
                     entrada=entrada,
                     score=r["score"],
                     decil=r["decil"],
+                    decil_externo=r["decil_externo"],
+                    modelos=r["modelos"],
                     decision=r["decision"],
                     motivos=r["motivos"],
                     monto_aprobado=r["monto_aprobado"],

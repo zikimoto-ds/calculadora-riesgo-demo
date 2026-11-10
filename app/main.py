@@ -1,111 +1,42 @@
-"""API de la calculadora de riesgo (demo con datos y reglas inventados)."""
+"""API de la calculadora de riesgo (demo con datos y reglas inventados).
+
+Módulos: autenticacion (login/token/roles), usuarios (administración), calculadora
+(reglas + ensamble de modelos + score externo), revisiones (zona gris con
+maker-checker) y dashboard. Las rutas de cálculo y revisión viven aquí.
+"""
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 
-import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, or_, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
-from . import calculadora, config, modelo, seguridad
+from . import autenticacion, calculadora, modelo, usuarios
+from .autenticacion import solo_supervisor, usuario_actual
 from .db import Base, get_db, motor
-from .models import Auditoria, CalculoLog, RefCliente, Revision, Usuario, ahora, utc
+from .esquemas import ResolverRevision, Solicitud
+from .models import Auditoria, CalculoLog, RefCliente, Revision, Usuario, ahora, auditar, utc
 
 RAIZ = Path(__file__).resolve().parent.parent
-_HASH_FALSO = seguridad.hashear_clave("no-es-una-clave-real")  # iguala el tiempo de respuesta ante usuarios inexistentes
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(motor)
-    modelo.cargar_modelo()
+    modelo.cargar_modelos()
     yield
 
 
-app = FastAPI(title="Calculadora de riesgo (demo)", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Calculadora de riesgo (demo)", version="0.3.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=RAIZ / "static"), name="static")
-bearer = HTTPBearer(auto_error=False)
+app.include_router(autenticacion.router)
+app.include_router(usuarios.router)
 
 
-# ---------- esquemas ----------
-class EsquemaBase(BaseModel):
-    """Rechaza NUL en cualquier campo de texto: PostgreSQL no lo admite y acabaría en un 500."""
-
-    @field_validator("*", mode="before")
-    @classmethod
-    def _sin_nul(cls, v):
-        if isinstance(v, str) and "\x00" in v:
-            raise ValueError("carácter NUL no permitido")
-        return v
-
-
-class Credenciales(EsquemaBase):
-    usuario: str = Field(min_length=1, max_length=50)
-    clave: str = Field(min_length=1, max_length=200)
-
-
-class Solicitud(EsquemaBase):
-    cliente_id: str | None = Field(default=None, max_length=20)
-    edad: int = Field(ge=18, le=100)
-    ingreso_mensual: float = Field(ge=1, le=10_000_000)  # mínimo 1: evita ratios infinitos con ingresos ínfimos
-    antiguedad_meses: int = Field(ge=0, le=720)
-    mora_promedio_dias: float = Field(ge=0, le=365)
-    creditos_previos: int = Field(ge=0, le=100)
-    deuda_mensual: float = Field(ge=0, le=10_000_000)
-    monto_solicitado: float = Field(ge=1, le=10_000_000)
-    plazo_meses: int = Field(ge=1, le=120)
-
-
-class ResolverRevision(EsquemaBase):
-    decision: Literal["aprobada", "rechazada"]
-    comentario: str | None = Field(default=None, max_length=500)
-
-
-class NuevoUsuario(EsquemaBase):
-    usuario: str = Field(min_length=3, max_length=50, pattern=r"^[a-z0-9._-]+$")
-    clave: str = Field(min_length=12, max_length=200)
-    rol: Literal["analista", "supervisor"] = "analista"
-
-
-# ---------- seguridad ----------
-def _auditar(db: Session, usuario: str | None, accion: str, detalle: str = "") -> None:
-    db.add(Auditoria(usuario=usuario, accion=accion, detalle=detalle[:300]))
-    db.commit()
-
-
-def _bloqueado(usuario: Usuario) -> bool:
-    return usuario.bloqueado_hasta is not None and ahora() < utc(usuario.bloqueado_hasta)
-
-
-def usuario_actual(
-    cred: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(get_db)
-) -> Usuario:
-    if cred is None:
-        raise HTTPException(401, "Falta el token")
-    try:
-        datos = seguridad.leer_token(cred.credentials)
-    except jwt.PyJWTError:
-        raise HTTPException(401, "Token inválido o vencido")
-    usuario = db.scalar(select(Usuario).where(Usuario.usuario == datos["sub"]))
-    if usuario is None or not usuario.activo or _bloqueado(usuario):
-        raise HTTPException(401, "Usuario inactivo")
-    return usuario
-
-
-def solo_supervisor(usuario: Usuario = Depends(usuario_actual)) -> Usuario:
-    if usuario.rol != "supervisor":
-        raise HTTPException(403, "Requiere rol supervisor")
-    return usuario
-
-
-# ---------- rutas ----------
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     """Lo consulta el balanceador de carga."""
@@ -121,69 +52,12 @@ def inicio():
     return FileResponse(RAIZ / "static" / "index.html")
 
 
-@app.post("/api/auth/login")
-def login(c: Credenciales, db: Session = Depends(get_db)):
-    usuario = db.scalar(select(Usuario).where(Usuario.usuario == c.usuario))
-    if usuario is None or not usuario.activo:
-        seguridad.verificar_clave(c.clave, _HASH_FALSO)
-        _auditar(db, c.usuario, "login_rechazado", "inexistente o inactivo")
-        raise HTTPException(401, "Credenciales inválidas")
-
-    # Reserva el intento ANTES de verificar la clave: el UPDATE condicional no reserva
-    # con la cuenta bloqueada y, en una ráfaga concurrente, solo los primeros
-    # MAX_INTENTOS llegan a verificar contra el hash real; el resto responde igual
-    # que una clave mala (verificación falsa para no cambiar el tiempo de respuesta).
-    sin_bloqueo = or_(Usuario.bloqueado_hasta.is_(None), Usuario.bloqueado_hasta < ahora())
-    intentos = db.execute(
-        update(Usuario)
-        .where(Usuario.id == usuario.id, sin_bloqueo)
-        .values(intentos_fallidos=Usuario.intentos_fallidos + 1)
-        .returning(Usuario.intentos_fallidos)
-        .execution_options(synchronize_session=False)
-    ).scalar_one_or_none()
-    if intentos is None or intentos > config.MAX_INTENTOS:
-        seguridad.verificar_clave(c.clave, _HASH_FALSO)
-        _auditar(db, usuario.usuario, "login_rechazado", "cuenta bloqueada")
-        raise HTTPException(401, "Credenciales inválidas")
-
-    if not seguridad.verificar_clave(c.clave, usuario.clave_hash):
-        detalle = f"intento {intentos}"
-        if intentos >= config.MAX_INTENTOS:
-            db.execute(
-                update(Usuario)
-                .where(Usuario.id == usuario.id)
-                .values(bloqueado_hasta=ahora() + timedelta(minutes=config.BLOQUEO_MINUTOS), intentos_fallidos=0)
-            )
-            detalle += f"; cuenta bloqueada {config.BLOQUEO_MINUTOS} min"
-        _auditar(db, usuario.usuario, "login_fallido", detalle)
-        raise HTTPException(401, "Credenciales inválidas")
-
-    # Reinicio condicional: si un bloqueo aterrizó mientras se verificaba la clave,
-    # el login correcto no lo borra ni emite token.
-    reinicio = db.execute(
-        update(Usuario)
-        .where(Usuario.id == usuario.id, or_(Usuario.bloqueado_hasta.is_(None), Usuario.bloqueado_hasta < ahora()))
-        .values(intentos_fallidos=0, bloqueado_hasta=None)
-        .execution_options(synchronize_session=False)
-    ).rowcount
-    if reinicio != 1:
-        _auditar(db, usuario.usuario, "login_rechazado", "cuenta bloqueada")
-        raise HTTPException(401, "Credenciales inválidas")
-    _auditar(db, usuario.usuario, "login_ok")
-    return {"token": seguridad.crear_token(usuario.usuario, usuario.rol), "rol": usuario.rol}
-
-
-@app.get("/api/auth/me")
-def yo(usuario: Usuario = Depends(usuario_actual)):
-    return {"usuario": usuario.usuario, "rol": usuario.rol}
-
-
 @app.get("/api/lookup/cliente/{cliente_id}")
 def lookup_cliente(cliente_id: str, usuario: Usuario = Depends(usuario_actual), db: Session = Depends(get_db)):
     c = db.get(RefCliente, cliente_id)
     if c is None:
         raise HTTPException(404, "Cliente no encontrado")
-    _auditar(db, usuario.usuario, "lookup_cliente", cliente_id)  # la bitácora registra quién consultó a quién
+    auditar(db, usuario.usuario, "lookup_cliente", cliente_id)  # la bitácora registra quién consultó a quién
     campos = ("edad", "ingreso_mensual", "antiguedad_meses", "mora_promedio_dias", "creditos_previos", "deuda_mensual")
     return {"cliente_id": c.cliente_id, **{k: getattr(c, k) for k in campos}}
 
@@ -207,6 +81,8 @@ def calcular(
         entrada=entrada,
         score=r["score"],
         decil=r["decil"],
+        decil_externo=r["decil_externo"],
+        modelos=r["modelos"],
         decision=r["decision"],
         motivos=r["motivos"],
         monto_aprobado=r["monto_aprobado"],
@@ -250,6 +126,7 @@ def listar_revisiones(
             "entrada": c.entrada if ve_el_caso(c) else None,
             "score": c.score,
             "decil": c.decil,
+            "decil_externo": c.decil_externo,
             "monto_sugerido": c.monto_aprobado,
             "motivos": c.motivos,
             "estado": r.estado,
@@ -319,6 +196,7 @@ def resumen(
         p = productos.setdefault(producto, {"total": 0, "decisiones": {}})
         p["decisiones"][decision] = {"n": n, "score_promedio": round(float(score_prom), 4)}
         p["total"] += n
+    _, metricas, _ = modelo.cargar_modelos()
     return {
         "dias": dias,
         "total": sum(p["total"] for p in productos.values()),
@@ -329,20 +207,5 @@ def resumen(
             "aprobada": resueltas.get("aprobada", 0),
             "rechazada": resueltas.get("rechazada", 0),
         },
+        "modelos": {n: {k: round(v, 3) for k, v in m.items()} for n, m in metricas.items()},
     }
-
-
-@app.post("/api/usuarios", status_code=201)
-def crear_usuario(
-    nuevo: NuevoUsuario, supervisor: Usuario = Depends(solo_supervisor), db: Session = Depends(get_db)
-):
-    if db.scalar(select(Usuario).where(Usuario.usuario == nuevo.usuario)) is not None:
-        raise HTTPException(409, "El usuario ya existe")
-    db.add(Usuario(usuario=nuevo.usuario, clave_hash=seguridad.hashear_clave(nuevo.clave), rol=nuevo.rol))
-    db.add(Auditoria(usuario=supervisor.usuario, accion="crear_usuario", detalle=f"{nuevo.usuario} ({nuevo.rol})"))
-    try:
-        db.commit()
-    except IntegrityError:  # dos peticiones simultáneas con el mismo nombre: la segunda choca con el índice único
-        db.rollback()
-        raise HTTPException(409, "El usuario ya existe")
-    return {"usuario": nuevo.usuario, "rol": nuevo.rol}

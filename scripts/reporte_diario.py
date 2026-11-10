@@ -33,6 +33,7 @@ def construir(fecha: date, tz: ZoneInfo) -> tuple[pd.DataFrame, pd.DataFrame]:
             CalculoLog.decision,
             CalculoLog.score,
             CalculoLog.decil,
+            CalculoLog.decil_externo,
             CalculoLog.monto_aprobado,
             Revision.estado.label("resolucion"),
             Revision.resuelto_por,

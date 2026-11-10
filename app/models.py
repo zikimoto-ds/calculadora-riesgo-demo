@@ -56,6 +56,8 @@ class CalculoLog(Base):
     entrada: Mapped[dict] = mapped_column(JSON)
     score: Mapped[float] = mapped_column(Float)
     decil: Mapped[int] = mapped_column(Integer)
+    decil_externo: Mapped[int | None] = mapped_column(Integer, nullable=True)  # None = el proveedor no respondió
+    modelos: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # probabilidad y decil por modelo del ensamble
     decision: Mapped[str] = mapped_column(String(20))  # aprobado | revision | rechazo
     motivos: Mapped[list] = mapped_column(JSON)
     monto_aprobado: Mapped[float] = mapped_column(Float)
@@ -84,3 +86,9 @@ class Auditoria(Base):
     usuario: Mapped[str | None] = mapped_column(String(50), nullable=True)
     accion: Mapped[str] = mapped_column(String(50))
     detalle: Mapped[str] = mapped_column(String(300), default="")
+
+
+def auditar(db, usuario: str | None, accion: str, detalle: str = "") -> None:
+    """Agrega la entrada de bitácora y confirma la transacción completa."""
+    db.add(Auditoria(usuario=usuario, accion=accion, detalle=detalle[:300]))
+    db.commit()

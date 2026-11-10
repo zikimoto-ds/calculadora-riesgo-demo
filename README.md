@@ -8,7 +8,9 @@ Proyecto personal: una API con interfaz mínima para decidir solicitudes de cré
 
 - Reemplazar una hoja de Excel por una aplicación con acceso por rol y cada resultado guardado con su entrada y la versión de reglas usada.
 - Reglas y cortes en un JSON versionado (`config/reglas.json`), separados del código.
-- Modelo entrenado al arrancar con datos sintéticos; no hay archivos `.pkl` en el repositorio.
+- Ensamble de modelos (regresión logística + XGBoost) entrenado al arrancar con datos sintéticos; no hay archivos `.pkl` en el repositorio. Cada cálculo guarda la probabilidad y el decil de cada modelo.
+- Cliente de un proveedor externo de score (simulado): si el proveedor no responde, el caso se degrada a revisión manual en lugar de decidirse sin el dato (`SCORE_EXTERNO=off` lo simula).
+- Módulo de administración de usuarios: alta, listado, activar/desactivar (invalida tokens vigentes) y cambio de clave.
 - Flujo de revisión manual: el analista calcula, el supervisor resuelve los casos en zona gris.
 - Reporte diario que reemplaza el armado manual: `scripts/reporte_diario.py`.
 - Propuesta de despliegue en AWS: [`docs/AWS.md`](docs/AWS.md).
@@ -19,7 +21,8 @@ Proyecto personal: una API con interfaz mínima para decidir solicitudes de cré
 flowchart LR
   A["Navegador<br/>static/index.html"] -->|JWT| B["FastAPI<br/>app/main.py"]
   B --> C["Reglas duras<br/>config/reglas.json"]
-  B --> D["Modelo de score<br/>regresión logística"]
+  B --> D["Ensamble de score<br/>reg. logística + XGBoost"]
+  B --> X["Proveedor externo de score<br/>(cliente simulado)"]
   B --> E[("PostgreSQL")]
   E --- F["calculo_log · revision_manual<br/>auditoria · usuarios · ref_cliente"]
   G["scripts/reporte_diario.py"] --> E
@@ -60,12 +63,17 @@ Reporte diario: `python -m scripts.reporte_diario --fecha 2026-01-15 --tz Americ
 | `POST /api/calcular/{producto}` | autenticado | Reglas + modelo + decisión; guarda el cálculo |
 | `GET /api/revisiones` | autenticado | Casos en revisión por estado (los datos del caso solo para supervisores o quien lo capturó) |
 | `POST /api/revisiones/{id}/resolver` | supervisor | Aprueba o rechaza un caso en revisión (nunca quien capturó el cálculo) |
-| `GET /api/dashboard/resumen` | autenticado | Conteos por producto, decisión y día, más el estado de las revisiones |
+| `GET /api/dashboard/resumen` | autenticado | Conteos por producto, decisión y día, estado de las revisiones y métricas de los modelos |
 | `POST /api/usuarios` | supervisor | Crea un usuario (clave de al menos 12 caracteres) |
+| `GET /api/usuarios` | supervisor | Listado para administración (sin hashes) |
+| `PATCH /api/usuarios/{usuario}/activo` | supervisor | Activa o desactiva una cuenta (nunca la propia); desactivar invalida los tokens vigentes |
+| `POST /api/usuarios/me/clave` | autenticado | Cambia la clave propia verificando la actual |
 
 ## Decisiones de diseño
 
-- Cada cálculo se guarda con su entrada, su resultado y la versión de reglas. Así se puede reconstruir cualquier decisión y medir después.
+- Cada cálculo se guarda con su entrada, su resultado, la versión de reglas y la probabilidad y el decil de cada modelo del ensamble. Así se puede reconstruir cualquier decisión y medir después.
+- El score final es el promedio de la regresión logística y el XGBoost; cada modelo aporta además su decil con cortes de cuantiles sobre el train. El monto ofertado se ajusta por un factor según el decil (`factor_oferta_decil` en las reglas).
+- El score del proveedor externo es insumo, no sustituto: si viene bajo el caso va a revisión manual, y si el proveedor no responde también, en lugar de decidir sin el dato.
 - Las claves usan scrypt de la biblioteca estándar. El login responde en tiempo similar para usuarios que no existen y no revela si la cuenta está bloqueada; el intento se reserva en la base con un UPDATE condicional antes de verificar la clave, así una ráfaga concurrente no consigue más verificaciones que el límite, y un login correcto no borra un bloqueo que llegó mientras verificaba. El bloqueo expira solo (15 minutos).
 - Los casos en zona gris los resuelve un supervisor distinto de quien capturó el cálculo (maker-checker), con un UPDATE condicional para que dos resoluciones simultáneas no se pisen.
 - No hay secretos en el repositorio: `JWT_SECRET` y las credenciales de la base vienen del entorno (en AWS, de Secrets Manager).
@@ -73,7 +81,8 @@ Reporte diario: `python -m scripts.reporte_diario --fecha 2026-01-15 --tz Americ
 
 ## Limitaciones
 
-- Las métricas del modelo (AUC ≈ 0.72, KS ≈ 0.34) miden el generador de datos sintéticos, no riesgo real.
+- Las métricas de los modelos (AUC ≈ 0.70–0.72, KS ≈ 0.31–0.34) miden el generador de datos sintéticos, no riesgo real. Como el generador es un proceso logístico, la regresión es el modelo "verdadero" y el XGBoost solo la alcanza con regularización fuerte; con datos reales la relación suele invertirse.
+- El proveedor externo de score es una simulación determinista; en producción sería una llamada HTTPS con timeout corto, reintentos y bitácora de consumo.
 - Las tablas se crean con `create_all`; en producción corresponde usar migraciones (Alembic).
 - La interfaz es mínima y no hay limitación de tasa dentro de la app (se propone en el WAF, ver `docs/AWS.md`); cada intento de login anónimo cuesta un scrypt y una fila de auditoría.
 - No hay revocación de sesiones: un token emitido sigue siendo válido hasta su vencimiento aunque la cuenta cambie de clave después. Como compensación parcial, una cuenta bloqueada tampoco puede usar sus tokens vigentes; el intercambio es deliberado (contener una cuenta posiblemente comprometida pesa más que la disponibilidad) y permite que cualquiera que conozca un usuario lo deje fuera 15 minutos con intentos fallidos. En producción, el límite de tasa por IP del WAF frena eso antes de llegar a la app.

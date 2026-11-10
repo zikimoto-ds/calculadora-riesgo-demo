@@ -54,6 +54,7 @@ def test_calcular_guarda_en_bitacora_y_aparece_en_dashboard(cliente):
     resumen = cliente.get("/api/dashboard/resumen", headers=h).json()
     assert resumen["total"] == 1
     assert resumen["por_producto"]["consumo"]["decisiones"]["aprobado"]["n"] == 1
+    assert set(resumen["modelos"]) == {"regresion_logistica", "xgboost", "ensamble"}
 
 
 def test_validacion_de_entrada(cliente):
@@ -127,6 +128,36 @@ def test_token_sin_claims_obligatorios_es_rechazado(cliente):
     sin_sub = pyjwt.encode({"rol": "supervisor"}, os.environ["JWT_SECRET"], algorithm="HS256")
     for t in (sin_exp, sin_sub):
         assert cliente.get("/api/auth/me", headers={"Authorization": "Bearer " + t}).status_code == 401
+
+
+def test_modulo_usuarios_listado_y_activacion(cliente):
+    ana = encabezados(cliente, "ana", CLAVE_ANA)
+    sup = encabezados(cliente, "sup", CLAVE_SUP)
+
+    assert cliente.get("/api/usuarios", headers=ana).status_code == 403
+    lista = cliente.get("/api/usuarios", headers=sup).json()
+    assert {u["usuario"] for u in lista} == {"ana", "sup"}
+    assert all("clave_hash" not in u and u["activo"] for u in lista)
+
+    assert cliente.patch("/api/usuarios/sup/activo", json={"activo": False}, headers=sup).status_code == 403
+    assert cliente.patch("/api/usuarios/nadie/activo", json={"activo": False}, headers=sup).status_code == 404
+    assert cliente.patch("/api/usuarios/ana/activo", json={"activo": False}, headers=sup).status_code == 200
+    assert cliente.get("/api/auth/me", headers=ana).status_code == 401  # el token vigente muere al desactivar
+    assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": CLAVE_ANA}).status_code == 401
+    assert cliente.patch("/api/usuarios/ana/activo", json={"activo": True}, headers=sup).status_code == 200
+    assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": CLAVE_ANA}).status_code == 200
+
+
+def test_cambio_de_clave_propia(cliente):
+    ana = encabezados(cliente, "ana", CLAVE_ANA)
+    nueva = "una-clave-nueva-larga-1"
+    mal = {"clave_actual": "equivocada", "clave_nueva": nueva}
+    assert cliente.post("/api/usuarios/me/clave", json=mal, headers=ana).status_code == 403
+    assert cliente.post("/api/usuarios/me/clave", json={"clave_actual": CLAVE_ANA, "clave_nueva": "corta"}, headers=ana).status_code == 422
+    ok = {"clave_actual": CLAVE_ANA, "clave_nueva": nueva}
+    assert cliente.post("/api/usuarios/me/clave", json=ok, headers=ana).status_code == 200
+    assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": CLAVE_ANA}).status_code == 401
+    assert cliente.post("/api/auth/login", json={"usuario": "ana", "clave": nueva}).status_code == 200
 
 
 def test_crear_usuario_solo_supervisor_y_clave_larga(cliente):

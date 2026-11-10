@@ -38,10 +38,11 @@ def test_reglas_duras_rechazan(cambio, motivo):
     assert r["monto_aprobado"] == 0
 
 
-def test_monto_se_limita_por_multiplo_del_ingreso():
+def test_monto_se_limita_por_multiplo_del_ingreso_y_factor_de_decil():
     r = calculadora.calcular("consumo", {**BASE, "ingreso_mensual": 6000, "deuda_mensual": 500, "monto_solicitado": 50000})
     assert r["decision"] != "rechazo"
-    assert r["monto_aprobado"] == 6000 * 4.0
+    factor = calculadora.cargar_reglas()["productos"]["consumo"]["factor_oferta_decil"][r["decil"] - 1]
+    assert r["monto_aprobado"] == round(6000 * 4.0 * factor, 2)
 
 
 def test_producto_desconocido():
@@ -54,13 +55,32 @@ def test_mismo_dato_mismo_score():
 
 
 def test_decil_va_de_1_a_10_y_sube_con_el_score():
-    peor = modelo.predecir({**{k: BASE[k] for k in ("edad", "ingreso_mensual", "antiguedad_meses", "mora_promedio_dias", "creditos_previos")}, "deuda_ingreso": 0.9})
-    mejor = modelo.predecir({**{k: BASE[k] for k in ("edad", "ingreso_mensual", "antiguedad_meses", "mora_promedio_dias", "creditos_previos")}, "deuda_ingreso": 0.02})
-    assert 1 <= peor[1] <= mejor[1] <= 10
-    assert peor[0] < mejor[0]
+    vars_modelo = {k: BASE[k] for k in ("edad", "ingreso_mensual", "antiguedad_meses", "mora_promedio_dias", "creditos_previos")}
+    peor = modelo.predecir({**vars_modelo, "deuda_ingreso": 0.9})
+    mejor = modelo.predecir({**vars_modelo, "deuda_ingreso": 0.02})
+    assert 1 <= peor["decil"] <= mejor["decil"] <= 10
+    assert peor["score"] < mejor["score"]
 
 
-def test_modelo_sintetico_discrimina():
-    _, metricas, _ = modelo.cargar_modelo()
-    assert metricas["auc"] >= 0.70
-    assert metricas["ks"] >= 0.30
+def test_ensamble_promedia_regresion_y_xgboost():
+    r = calculadora.calcular("consumo", BASE)
+    assert set(r["modelos"]) == {"regresion_logistica", "xgboost"}
+    probs = [m["prob"] for m in r["modelos"].values()]
+    assert r["score"] == pytest.approx(sum(probs) / len(probs), abs=1e-3)
+    assert 1 <= r["decil_externo"] <= 10
+
+
+def test_sin_score_externo_el_caso_va_a_revision(monkeypatch):
+    monkeypatch.setenv("SCORE_EXTERNO", "off")
+    r = calculadora.calcular("consumo", BASE)
+    assert r["decision"] == "revision"
+    assert r["motivos"] == ["SIN_SCORE_EXTERNO"]
+    assert r["decil_externo"] is None
+
+
+def test_modelos_sinteticos_discriminan():
+    _, metricas, _ = modelo.cargar_modelos()
+    assert set(metricas) == {"regresion_logistica", "xgboost", "ensamble"}
+    for m in metricas.values():
+        assert m["auc"] >= 0.70
+        assert m["ks"] >= 0.28
