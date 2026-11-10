@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -124,18 +124,29 @@ def inicio():
 @app.post("/api/auth/login")
 def login(c: Credenciales, db: Session = Depends(get_db)):
     usuario = db.scalar(select(Usuario).where(Usuario.usuario == c.usuario))
-    if usuario is None or not usuario.activo or _bloqueado(usuario):
+    if usuario is None or not usuario.activo:
         seguridad.verificar_clave(c.clave, _HASH_FALSO)
-        _auditar(db, c.usuario, "login_rechazado", "inexistente, inactivo o bloqueado")
+        _auditar(db, c.usuario, "login_rechazado", "inexistente o inactivo")
         raise HTTPException(401, "Credenciales inválidas")
+
+    # Reserva el intento ANTES de verificar la clave: el UPDATE condicional no reserva
+    # con la cuenta bloqueada y, en una ráfaga concurrente, solo los primeros
+    # MAX_INTENTOS llegan a verificar contra el hash real; el resto responde igual
+    # que una clave mala (verificación falsa para no cambiar el tiempo de respuesta).
+    sin_bloqueo = or_(Usuario.bloqueado_hasta.is_(None), Usuario.bloqueado_hasta < ahora())
+    intentos = db.execute(
+        update(Usuario)
+        .where(Usuario.id == usuario.id, sin_bloqueo)
+        .values(intentos_fallidos=Usuario.intentos_fallidos + 1)
+        .returning(Usuario.intentos_fallidos)
+        .execution_options(synchronize_session=False)
+    ).scalar_one_or_none()
+    if intentos is None or intentos > config.MAX_INTENTOS:
+        seguridad.verificar_clave(c.clave, _HASH_FALSO)
+        _auditar(db, usuario.usuario, "login_rechazado", "cuenta bloqueada")
+        raise HTTPException(401, "Credenciales inválidas")
+
     if not seguridad.verificar_clave(c.clave, usuario.clave_hash):
-        # Incremento atómico en la base: con peticiones concurrentes un += en memoria pierde intentos.
-        intentos = db.execute(
-            update(Usuario)
-            .where(Usuario.id == usuario.id)
-            .values(intentos_fallidos=Usuario.intentos_fallidos + 1)
-            .returning(Usuario.intentos_fallidos)
-        ).scalar_one()
         detalle = f"intento {intentos}"
         if intentos >= config.MAX_INTENTOS:
             db.execute(
@@ -146,8 +157,18 @@ def login(c: Credenciales, db: Session = Depends(get_db)):
             detalle += f"; cuenta bloqueada {config.BLOQUEO_MINUTOS} min"
         _auditar(db, usuario.usuario, "login_fallido", detalle)
         raise HTTPException(401, "Credenciales inválidas")
-    usuario.intentos_fallidos = 0
-    usuario.bloqueado_hasta = None
+
+    # Reinicio condicional: si un bloqueo aterrizó mientras se verificaba la clave,
+    # el login correcto no lo borra ni emite token.
+    reinicio = db.execute(
+        update(Usuario)
+        .where(Usuario.id == usuario.id, or_(Usuario.bloqueado_hasta.is_(None), Usuario.bloqueado_hasta < ahora()))
+        .values(intentos_fallidos=0, bloqueado_hasta=None)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if reinicio != 1:
+        _auditar(db, usuario.usuario, "login_rechazado", "cuenta bloqueada")
+        raise HTTPException(401, "Credenciales inválidas")
     _auditar(db, usuario.usuario, "login_ok")
     return {"token": seguridad.crear_token(usuario.usuario, usuario.rol), "rol": usuario.rol}
 
@@ -204,7 +225,7 @@ def calcular(
 def listar_revisiones(
     estado: Literal["pendiente", "aprobada", "rechazada"] = "pendiente",
     limite: int = Query(50, ge=1, le=200),
-    _: Usuario = Depends(usuario_actual),
+    usuario: Usuario = Depends(usuario_actual),
     db: Session = Depends(get_db),
 ):
     filas = db.execute(
@@ -214,14 +235,19 @@ def listar_revisiones(
         .order_by(Revision.id.desc())
         .limit(limite)
     ).all()
+
+    def ve_el_caso(c: CalculoLog) -> bool:
+        # Los datos del caso solo los ve quien resuelve (supervisor) o quien lo capturó.
+        return usuario.rol == "supervisor" or c.usuario == usuario.usuario
+
     return [
         {
             "id": r.id,
             "calculo_id": c.id,
             "producto": c.producto,
             "capturado_por": c.usuario,
-            "cliente_id": c.cliente_id,
-            "entrada": c.entrada,  # el supervisor resuelve viendo los datos del caso, no solo el score
+            "cliente_id": c.cliente_id if ve_el_caso(c) else None,
+            "entrada": c.entrada if ve_el_caso(c) else None,
             "score": c.score,
             "decil": c.decil,
             "monto_sugerido": c.monto_aprobado,

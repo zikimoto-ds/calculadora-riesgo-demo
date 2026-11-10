@@ -58,7 +58,7 @@ Reporte diario: `python -m scripts.reporte_diario --fecha 2026-01-15 --tz Americ
 | `GET /api/auth/me` | autenticado | Usuario y rol del token |
 | `GET /api/lookup/cliente/{id}` | autenticado | Autocompleta la captura desde la tabla de referencia |
 | `POST /api/calcular/{producto}` | autenticado | Reglas + modelo + decisión; guarda el cálculo |
-| `GET /api/revisiones` | autenticado | Casos en revisión por estado |
+| `GET /api/revisiones` | autenticado | Casos en revisión por estado (los datos del caso solo para supervisores o quien lo capturó) |
 | `POST /api/revisiones/{id}/resolver` | supervisor | Aprueba o rechaza un caso en revisión (nunca quien capturó el cálculo) |
 | `GET /api/dashboard/resumen` | autenticado | Conteos por producto, decisión y día, más el estado de las revisiones |
 | `POST /api/usuarios` | supervisor | Crea un usuario (clave de al menos 12 caracteres) |
@@ -66,7 +66,7 @@ Reporte diario: `python -m scripts.reporte_diario --fecha 2026-01-15 --tz Americ
 ## Decisiones de diseño
 
 - Cada cálculo se guarda con su entrada, su resultado y la versión de reglas. Así se puede reconstruir cualquier decisión y medir después.
-- Las claves usan scrypt de la biblioteca estándar. El login responde en tiempo similar para usuarios que no existen y no revela si la cuenta está bloqueada; el contador de intentos se incrementa de forma atómica en la base y el bloqueo expira solo (15 minutos).
+- Las claves usan scrypt de la biblioteca estándar. El login responde en tiempo similar para usuarios que no existen y no revela si la cuenta está bloqueada; el intento se reserva en la base con un UPDATE condicional antes de verificar la clave, así una ráfaga concurrente no consigue más verificaciones que el límite, y un login correcto no borra un bloqueo que llegó mientras verificaba. El bloqueo expira solo (15 minutos).
 - Los casos en zona gris los resuelve un supervisor distinto de quien capturó el cálculo (maker-checker), con un UPDATE condicional para que dos resoluciones simultáneas no se pisen.
 - No hay secretos en el repositorio: `JWT_SECRET` y las credenciales de la base vienen del entorno (en AWS, de Secrets Manager).
 - El modelo se entrena con semilla fija en lugar de cargar un archivo binario. Con datos reales conviene versionarlo con su documentación y validarlo con un corte temporal.
@@ -76,7 +76,7 @@ Reporte diario: `python -m scripts.reporte_diario --fecha 2026-01-15 --tz Americ
 - Las métricas del modelo (AUC ≈ 0.72, KS ≈ 0.34) miden el generador de datos sintéticos, no riesgo real.
 - Las tablas se crean con `create_all`; en producción corresponde usar migraciones (Alembic).
 - La interfaz es mínima y no hay limitación de tasa dentro de la app (se propone en el WAF, ver `docs/AWS.md`); cada intento de login anónimo cuesta un scrypt y una fila de auditoría.
-- No hay revocación de sesiones: un token emitido sigue siendo válido hasta su vencimiento aunque la cuenta se bloquee o cambie de clave después.
+- No hay revocación de sesiones: un token emitido sigue siendo válido hasta su vencimiento aunque la cuenta cambie de clave después. Como compensación parcial, una cuenta bloqueada tampoco puede usar sus tokens vigentes; el intercambio es deliberado (contener una cuenta posiblemente comprometida pesa más que la disponibilidad) y permite que cualquiera que conozca un usuario lo deje fuera 15 minutos con intentos fallidos. En producción, el límite de tasa por IP del WAF frena eso antes de llegar a la app.
 - `config/reglas.json` se carga una vez por proceso; aplicar cambios requiere reiniciar la API (cada cálculo guarda la versión que lo decidió).
 - Las pruebas automáticas corren sobre SQLite; la ruta con PostgreSQL y `docker compose` no está cubierta por CI.
 

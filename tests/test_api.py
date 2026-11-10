@@ -94,6 +94,22 @@ def test_rechaza_nul_e_ingresos_degenerados(cliente):
     assert cliente.post("/api/revisiones/1/resolver", json=rev, headers=encabezados(cliente, "sup", CLAVE_SUP)).status_code == 422
 
 
+def test_datos_del_caso_solo_para_supervisor_o_quien_capturo(cliente):
+    ana = encabezados(cliente, "ana", CLAVE_ANA)
+    sup = encabezados(cliente, "sup", CLAVE_SUP)
+    caso = {**_caso_en_revision(), "cliente_id": "CLI-000001"}
+    assert cliente.post("/api/calcular/consumo", json=caso, headers=ana).json()["decision"] == "revision"
+
+    otro = {"usuario": "otra.analista", "clave": "clave-larga-de-prueba", "rol": "analista"}
+    assert cliente.post("/api/usuarios", json=otro, headers=sup).status_code == 201
+    tercera = encabezados(cliente, "otra.analista", "clave-larga-de-prueba")
+
+    for h, ve in ((ana, True), (sup, True), (tercera, False)):
+        fila = cliente.get("/api/revisiones", headers=h).json()[0]
+        assert fila["capturado_por"] == "ana"
+        assert (fila["entrada"] is not None) is ve and (fila["cliente_id"] is not None) is ve
+
+
 def test_supervisor_no_resuelve_su_propio_calculo(cliente):
     sup = encabezados(cliente, "sup", CLAVE_SUP)
     r = cliente.post("/api/calcular/consumo", json=_caso_en_revision(), headers=sup)
