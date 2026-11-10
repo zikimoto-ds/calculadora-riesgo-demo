@@ -38,25 +38,36 @@ def usuario_actual(
     return usuario
 
 
-def registrar_intento_fallido(db: Session, usuario: Usuario) -> int | None:
-    """Suma un intento fallido (mismo contador que el login) y bloquea la cuenta al llegar al límite.
+def sin_bloqueo_vigente():
+    return or_(Usuario.bloqueado_hasta.is_(None), Usuario.bloqueado_hasta < ahora())
 
-    Devuelve el número de intento, o None si la cuenta ya estaba bloqueada.
+
+def reservar_intento(db: Session, usuario: Usuario) -> int | None:
+    """Reserva un intento de autenticación ANTES de verificar la clave.
+
+    El UPDATE condicional no reserva con la cuenta bloqueada (devuelve None) y, en una
+    ráfaga concurrente, solo los primeros MAX_INTENTOS llegan a verificar contra el
+    hash real; quien llama trata el excedente igual que una clave mala.
     """
-    intentos = db.execute(
+    return db.execute(
         update(Usuario)
-        .where(Usuario.id == usuario.id, or_(Usuario.bloqueado_hasta.is_(None), Usuario.bloqueado_hasta < ahora()))
+        .where(Usuario.id == usuario.id, sin_bloqueo_vigente())
         .values(intentos_fallidos=Usuario.intentos_fallidos + 1)
         .returning(Usuario.intentos_fallidos)
         .execution_options(synchronize_session=False)
     ).scalar_one_or_none()
-    if intentos is not None and intentos >= config.MAX_INTENTOS:
-        db.execute(
-            update(Usuario)
-            .where(Usuario.id == usuario.id)
-            .values(bloqueado_hasta=ahora() + timedelta(minutes=config.BLOQUEO_MINUTOS), intentos_fallidos=0)
-        )
-    return intentos
+
+
+def bloquear_al_limite(db: Session, usuario: Usuario, intentos: int) -> bool:
+    """Bloquea la cuenta si el intento reservado llegó al límite. Devuelve si bloqueó."""
+    if intentos < config.MAX_INTENTOS:
+        return False
+    db.execute(
+        update(Usuario)
+        .where(Usuario.id == usuario.id)
+        .values(bloqueado_hasta=ahora() + timedelta(minutes=config.BLOQUEO_MINUTOS), intentos_fallidos=0)
+    )
+    return True
 
 
 def solo_supervisor(usuario: Usuario = Depends(usuario_actual)) -> Usuario:
@@ -73,18 +84,9 @@ def login(c: Credenciales, db: Session = Depends(get_db)):
         auditar(db, c.usuario, "login_rechazado", "inexistente o inactivo")
         raise HTTPException(401, "Credenciales inválidas")
 
-    # Reserva el intento ANTES de verificar la clave: el UPDATE condicional no reserva
-    # con la cuenta bloqueada y, en una ráfaga concurrente, solo los primeros
-    # MAX_INTENTOS llegan a verificar contra el hash real; el resto responde igual
-    # que una clave mala (verificación falsa para no cambiar el tiempo de respuesta).
-    sin_bloqueo = or_(Usuario.bloqueado_hasta.is_(None), Usuario.bloqueado_hasta < ahora())
-    intentos = db.execute(
-        update(Usuario)
-        .where(Usuario.id == usuario.id, sin_bloqueo)
-        .values(intentos_fallidos=Usuario.intentos_fallidos + 1)
-        .returning(Usuario.intentos_fallidos)
-        .execution_options(synchronize_session=False)
-    ).scalar_one_or_none()
+    # El excedente de la reserva responde igual que una clave mala (verificación
+    # falsa para no cambiar el tiempo de respuesta).
+    intentos = reservar_intento(db, usuario)
     if intentos is None or intentos > config.MAX_INTENTOS:
         seguridad.verificar_clave(c.clave, _HASH_FALSO)
         auditar(db, usuario.usuario, "login_rechazado", "cuenta bloqueada")
@@ -92,12 +94,7 @@ def login(c: Credenciales, db: Session = Depends(get_db)):
 
     if not seguridad.verificar_clave(c.clave, usuario.clave_hash):
         detalle = f"intento {intentos}"
-        if intentos >= config.MAX_INTENTOS:
-            db.execute(
-                update(Usuario)
-                .where(Usuario.id == usuario.id)
-                .values(bloqueado_hasta=ahora() + timedelta(minutes=config.BLOQUEO_MINUTOS), intentos_fallidos=0)
-            )
+        if bloquear_al_limite(db, usuario, intentos):
             detalle += f"; cuenta bloqueada {config.BLOQUEO_MINUTOS} min"
         auditar(db, usuario.usuario, "login_fallido", detalle)
         raise HTTPException(401, "Credenciales inválidas")
@@ -106,7 +103,7 @@ def login(c: Credenciales, db: Session = Depends(get_db)):
     # el login correcto no lo borra ni emite token.
     reinicio = db.execute(
         update(Usuario)
-        .where(Usuario.id == usuario.id, or_(Usuario.bloqueado_hasta.is_(None), Usuario.bloqueado_hasta < ahora()))
+        .where(Usuario.id == usuario.id, sin_bloqueo_vigente())
         .values(intentos_fallidos=0, bloqueado_hasta=None)
         .execution_options(synchronize_session=False)
     ).rowcount
